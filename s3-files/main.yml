@@ -8,6 +8,9 @@ Parameters:
     Type: AWS::EC2::VPC::Id
   SubnetId:
     Type: AWS::EC2::Subnet::Id
+  Ec2AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
 
 Resources:
   S3Bucket:
@@ -23,21 +26,6 @@ Resources:
       Bucket: !GetAtt S3Bucket.Arn
       RoleArn: !GetAtt S3FilesSystemRole.Arn
 
-  S3FilesAccessPointLambda:
-    Type: AWS::S3Files::AccessPoint
-    Properties:
-      FileSystemId: !Ref S3FilesSystem
-      PosixUser: 
-        Gid: 1000
-        Uid: 1000
-      RootDirectory:
-        Path: "/lambda"
-        # Allow User ID 1000 to read/write/execute in the root directory
-        CreationPermissions:
-          OwnerGid: 1000
-          OwnerUid: 1000
-          Permissions: "755"
-
   # For production use, consider creating mount targets in multiple AZs for high availability.
   S3FilesMountTarget:
     Type: AWS::S3Files::MountTarget
@@ -52,15 +40,6 @@ Resources:
     Properties:
       GroupDescription: !Sub "${AWS::StackName}-s3-files-sg"
       VpcId: !Ref VpcId
-
-  S3FilesSecurityGroupIngressLambda:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref S3FilesSecurityGroup
-      IpProtocol: tcp
-      FromPort: 2049
-      ToPort: 2049
-      SourceSecurityGroupId: !Ref LambdaSecurityGroup
 
   S3FilesSystemRole:
     Type: AWS::IAM::Role
@@ -136,6 +115,42 @@ Resources:
                   - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
 
   # ===== Lambda =====
+  S3FilesAccessPointLambda:
+    Type: AWS::S3Files::AccessPoint
+    Properties:
+      FileSystemId: !Ref S3FilesSystem
+      PosixUser: 
+        Gid: 1000
+        Uid: 1000
+      RootDirectory:
+        Path: "/lambda"
+        # Allow User ID 1000 to read/write/execute in the root directory
+        CreationPermissions:
+          OwnerGid: 1000
+          OwnerUid: 1000
+          Permissions: "755"
+
+  S3FilesSecurityGroupIngressLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref S3FilesSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName}-lambda-sg"
+      VpcId: !Ref VpcId
+      # S3 File System uses NFS (port 2049) over the VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          DestinationSecurityGroupId: !Ref S3FilesSecurityGroup
+
   # NOTE: Ensure the S3 VPC Endpoint or NAT Gateway is configured to allow access between VPC and S3
   Lambda:
     Type: AWS::Lambda::Function
@@ -176,22 +191,10 @@ Resources:
           - !Ref LambdaSecurityGroup
         SubnetIds:
           - !Ref SubnetId
-      # Mount the S3 File System at /mnt/lambda
+      # Mount the S3 Files System at /mnt/lambda
       FileSystemConfigs:
         - Arn: !GetAtt S3FilesAccessPointLambda.AccessPointArn
           LocalMountPath: /mnt/lambda
-
-  LambdaSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: !Sub "${AWS::StackName}-lambda-sg"
-      VpcId: !Ref VpcId
-      # S3 File System uses NFS (port 2049) over the VPC
-      SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 2049
-          ToPort: 2049
-          DestinationSecurityGroupId: !Ref S3FilesSecurityGroup
 
   LambdaExecutionRole:
     Type: AWS::IAM::Role
@@ -242,6 +245,23 @@ Resources:
       ToPort: 2049
       SourceSecurityGroupId: !Ref EcsTaskSecurityGroup
 
+  EcsTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName}-ecs-task-sg"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: ECR image pull and CloudWatch Logs via NAT Gateway
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          DestinationSecurityGroupId: !Ref S3FilesSecurityGroup
+          Description: S3 Files mount target
+
   EcrRepository:
     Type: AWS::ECR::Repository
     Properties:
@@ -259,23 +279,6 @@ Resources:
     Properties:
       LogGroupName: !Sub "/ecs/${AWS::StackName}"
       RetentionInDays: 7
-
-  EcsTaskSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: !Sub "${AWS::StackName}-ecs-task-sg"
-      VpcId: !Ref VpcId
-      SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: ECR image pull and CloudWatch Logs via NAT Gateway
-        - IpProtocol: tcp
-          FromPort: 2049
-          ToPort: 2049
-          DestinationSecurityGroupId: !Ref S3FilesSecurityGroup
-          Description: S3 Files mount target
 
   EcsTaskExecutionRole:
     Type: AWS::IAM::Role
@@ -346,7 +349,7 @@ Resources:
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: ecs
 
-  EcsService:     
+  EcsService:
     Type: AWS::ECS::Service
     DependsOn: S3FilesMountTarget
     Properties:
@@ -360,3 +363,99 @@ Resources:
             - !Ref SubnetId
           SecurityGroups:
             - !Ref EcsTaskSecurityGroup
+
+  # ===== EC2 =====
+  S3FilesAccessPointEc2:
+    Type: AWS::S3Files::AccessPoint
+    Properties:
+      FileSystemId: !Ref S3FilesSystem
+      PosixUser:
+        Gid: 1002
+        Uid: 1002
+      RootDirectory:
+        Path: "/ec2"
+        CreationPermissions:
+          OwnerGid: 1002
+          OwnerUid: 1002
+          Permissions: "755"
+
+  S3FilesSecurityGroupIngressEc2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref S3FilesSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref Ec2SecurityGroup
+
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName}-ec2-sg"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          DestinationSecurityGroupId: !Ref S3FilesSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: SSM and S3 via NAT Gateway
+
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3FilesClientReadWriteAccess
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-Ec2S3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2InstanceRole
+
+  # NOTE: Ensure the S3 VPC Endpoint or NAT Gateway is configured to allow access between VPC and S3
+  Ec2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: S3FilesMountTarget
+    Properties:
+      ImageId: !Ref Ec2AmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      SecurityGroupIds:
+        - !Ref Ec2SecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          # Mount S3 Files access point
+          sudo yum install -y amazon-efs-utils
+          sudo mkdir -p /mnt/ec2
+          sudo mount -t s3files -o accesspoint=${S3FilesAccessPointEc2.AccessPointId} ${S3FilesSystem.FileSystemId} /mnt/ec2
+
+          # Test writing a file (to be deleted)
+          TIMESTAMP=$(date +%s)
+          FILE="/mnt/ec2/demo-$TIMESTAMP.txt"
+          echo "Hello from EC2! Written at $TIMESTAMP" > "$FILE"
