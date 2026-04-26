@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: S3 Files
+
+Parameters:
+  S3BucketName:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration: 
+        Status: Enabled
+
+  S3FilesSystem:
+    Type: AWS::S3Files::FileSystem
+    Properties:
+      Bucket: !GetAtt S3Bucket.Arn
+      RoleArn: !GetAtt S3FilesSystemRole.Arn
+
+  S3FilesAccessPoint:
+    Type: AWS::S3Files::AccessPoint
+    Properties:
+      FileSystemId: !Ref S3FilesSystem
+      PosixUser: 
+        Gid: 1000
+        Uid: 1000
+      RootDirectory:
+        Path: "/lambda"
+        # Allow User ID 1000 to read/write/execute in the root directory
+        CreationPermissions:
+          OwnerGid: 1000
+          OwnerUid: 1000
+          Permissions: "755"
+
+  # For production use, consider creating mount targets in multiple AZs for high availability.
+  S3FilesMountTarget:
+    Type: AWS::S3Files::MountTarget
+    Properties:
+      FileSystemId: !Ref S3FilesSystem
+      SubnetId: !Ref SubnetId
+      SecurityGroups:
+        - !Ref S3FilesSecurityGroup
+
+  S3FilesSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName}-s3-files-sg"
+      VpcId: !Ref VpcId
+
+  S3FilesSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref S3FilesSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  S3FilesSystemRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticfilesystem.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-s3-files"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3Bucket}"
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject*
+                  - s3:GetObject*
+                  - s3:List*
+                  - s3:PutObject*
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3Bucket}/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncryptFrom
+                  - kms:ReEncryptTo
+                Resource:
+                  - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:*"
+                Condition:
+                  StringLike:
+                    kms:ViaService: !Sub "s3.${AWS::Region}.amazonaws.com"
+                    "kms:EncryptionContext:aws:s3:arn":
+                      - !Sub "arn:aws:s3:::${S3Bucket}"
+                      - !Sub "arn:aws:s3:::${S3Bucket}/*"
+              - Effect: Allow
+                Action:
+                  - events:DeleteRule
+                  - events:DisableRule
+                  - events:EnableRule
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                Resource:
+                  - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-S3-Files*"
+                Condition:
+                  StringEquals:
+                    events:ManagedBy: elasticfilesystem.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - events:DescribeRule
+                  - events:ListRuleNamesByTarget
+                  - events:ListRules
+                  - events:ListTargetsByRule
+                Resource:
+                  - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+
+  # NOTE: Ensure the VPC has S3 access through a VPC Endpoint or NAT Gateway
+  Lambda:
+    Type: AWS::Lambda::Function
+    DependsOn: S3FilesMountTarget
+    Properties:
+      FunctionName: s3-files-demo
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Runtime: python3.14
+      MemorySize: 512
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import time
+
+          MOUNT_PATH = "/mnt/lambda"
+
+
+          def lambda_handler(event, context):
+              timestamp = int(time.time())
+              filename = f"demo-{timestamp}.txt"
+              filepath = os.path.join(MOUNT_PATH, filename)
+              content = f"Hello from Lambda! Written at {timestamp}"
+
+              with open(filepath, "w") as f:
+                  f.write(content)
+
+              files = os.listdir(MOUNT_PATH)
+
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps({"files_in_mount": files[:20]}),
+              }
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetId
+      # Mount the S3 File System at /mnt/lambda
+      FileSystemConfigs:
+        - Arn: !GetAtt S3FilesAccessPoint.AccessPointArn
+          LocalMountPath: /mnt/lambda
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda S3 Files Demo SG
+      VpcId: !Ref VpcId
+      # S3 File System uses NFS (port 2049) over the VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          DestinationSecurityGroupId: !Ref S3FilesSecurityGroup
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3FilesClientReadWriteAccess
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-LambdaS3FilesAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
