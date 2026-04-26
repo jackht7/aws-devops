@@ -23,7 +23,7 @@ Resources:
       Bucket: !GetAtt S3Bucket.Arn
       RoleArn: !GetAtt S3FilesSystemRole.Arn
 
-  S3FilesAccessPoint:
+  S3FilesAccessPointLambda:
     Type: AWS::S3Files::AccessPoint
     Properties:
       FileSystemId: !Ref S3FilesSystem
@@ -53,7 +53,7 @@ Resources:
       GroupDescription: !Sub "${AWS::StackName}-s3-files-sg"
       VpcId: !Ref VpcId
 
-  S3FilesSecurityGroupIngress:
+  S3FilesSecurityGroupIngressLambda:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
       GroupId: !Ref S3FilesSecurityGroup
@@ -135,7 +135,8 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
 
-  # NOTE: Ensure the VPC has S3 access through a VPC Endpoint or NAT Gateway
+  # ===== Lambda =====
+  # NOTE: Ensure the S3 VPC Endpoint or NAT Gateway is configured to allow access between VPC and S3
   Lambda:
     Type: AWS::Lambda::Function
     DependsOn: S3FilesMountTarget
@@ -177,13 +178,13 @@ Resources:
           - !Ref SubnetId
       # Mount the S3 File System at /mnt/lambda
       FileSystemConfigs:
-        - Arn: !GetAtt S3FilesAccessPoint.AccessPointArn
+        - Arn: !GetAtt S3FilesAccessPointLambda.AccessPointArn
           LocalMountPath: /mnt/lambda
 
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Lambda S3 Files Demo SG
+      GroupDescription: !Sub "${AWS::StackName}-lambda-sg"
       VpcId: !Ref VpcId
       # S3 File System uses NFS (port 2049) over the VPC
       SecurityGroupEgress:
@@ -215,3 +216,147 @@ Resources:
                   - s3:GetObject
                   - s3:GetObjectVersion
                 Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+
+  # ===== ECS Task =====
+  S3FilesAccessPointEcs:
+    Type: AWS::S3Files::AccessPoint
+    Properties:
+      FileSystemId: !Ref S3FilesSystem
+      PosixUser: 
+        Gid: 1001
+        Uid: 1001
+      RootDirectory:
+        Path: "/ecs"
+        # Allow User ID 1001 to read/write/execute in the root directory
+        CreationPermissions:
+          OwnerGid: 1001
+          OwnerUid: 1001
+          Permissions: "755"
+
+  S3FilesSecurityGroupIngressECS:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref S3FilesSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref EcsTaskSecurityGroup
+
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}"
+
+  # NOTE: Ensure the S3 VPC Endpoint or NAT Gateway is configured to allow access between VPC and S3
+  # NOTE: Ensure the ECR VPC endpoint or NAT Gateway is configured to allow access for image pulls from ECR
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+
+  EcsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}"
+      RetentionInDays: 7
+
+  EcsTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName}-ecs-task-sg"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: ECR image pull and CloudWatch Logs via NAT Gateway
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          DestinationSecurityGroupId: !Ref S3FilesSecurityGroup
+          Description: S3 Files mount target
+
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FilesClientReadWriteAccess
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-ECSTaskS3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+
+  EcsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: S3FilesMountTarget
+    Properties:
+      Family: !Sub "${AWS::StackName}-s3-files"
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      Volumes:
+        - Name: s3-files
+          S3FilesVolumeConfiguration:
+            FileSystemArn: !GetAtt S3FilesSystem.FileSystemArn
+            AccessPointArn: !GetAtt S3FilesAccessPointEcs.AccessPointArn
+      ContainerDefinitions:
+        - Name: !Sub "${AWS::StackName}-s3-files"
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:latest"
+          Essential: true
+          User: "1001:1001"
+          MountPoints:
+            - SourceVolume: s3-files
+              ContainerPath: /mnt/ecs
+              ReadOnly: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref EcsLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  EcsService:     
+    Type: AWS::ECS::Service
+    DependsOn: S3FilesMountTarget
+    Properties:
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref EcsTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref SubnetId
+          SecurityGroups:
+            - !Ref EcsTaskSecurityGroup
